@@ -26,6 +26,8 @@ npx playwright install chromium
 cp .env.example .env          # add your API key(s) and model id
 ```
 
+> Free-tier models are slow. If longer tasks hit the 6-minute run budget, add `MAX_DURATION_MS=900000` (15 min) to `.env`.
+
 **Terminal 1** (the simulated company):
 ```bash
 npm run sandbox               # http://localhost:4000
@@ -185,7 +187,7 @@ Reset the sandbox (`npm run reset`) before each one.
 - **LLM-based verification can misjudge.** It reasons over ground-truth data, but the judgment itself is still a model call.
 - **In-memory sandbox data.** It resets when the server restarts.
 - **CLI interface.** Approvals and questions happen in the terminal.
-- **Free-tier rate limits.** Runs are slow and can occasionally fail when the quota is exhausted.
+- **Free-tier latency and rate limits.** A run takes several minutes because every step waits on a free-tier LLM call. During testing, scenario B correctly asked which Globex vendor was meant and filled the form, but hit the default 6-minute time budget just before saving. The budget is configurable (`MAX_DURATION_MS` in `.env`).
 - **No learning across runs.** Each task starts fresh.
 - **No PDF or scanned-document parsing.**
 - **Manual testing only.** Scenarios were validated individually during development; there is no automated regression suite in CI yet.
