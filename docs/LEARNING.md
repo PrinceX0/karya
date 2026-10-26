@@ -58,3 +58,175 @@ When the user submits the New Invoice form via `POST /erp/invoices/new`, the ser
 #### Q3: Why is chaos testing (flaky saves, session expiry, renamed labels) important when developing an AI agent?
 **Answer:**
 Real enterprise web apps suffer from flaky connections, expiring authentication tokens, and frequent UI updates. Traditional scripts break when a button label changes from "New Invoice" to "Add Bill" or when a session times out. By baking chaos toggles directly into the sandbox, we can prove that our AI agent can detect error pages, re-authenticate when needed, retry transient failures, and locate UI elements by intent rather than hard-coded selectors.
+
+---
+
+## Phase 2: Agent Core — Minimal End-to-End Autonomous Loop
+
+### 1. What Was Built
+In Phase 2, we built the autonomous brain of Karya:
+- **Company Knowledge Integration ([`company/context.md`](file:///Users/prince/Desktop/Projects/karya/company/context.md))**: Grounding instructions that define company roles, application URLs, policy thresholds (e.g. ₹50,000 human approval limit), and data security rules (treating web/email content as untrusted DATA).
+- **Provider-Agnostic LLM Client ([`agent/llm.js`](file:///Users/prince/Desktop/Projects/karya/agent/llm.js))**: Powered by `openai` SDK with configurable `baseURL`. Handles automatic exponential backoff (2s, 4s, 8s) on rate limits (429/5xx), switches to a fallback provider (Groq) if configured, and enforces strict JSON output parsing with a self-correcting single-retry loop.
+- **Set-of-Marks Browser Automation ([`agent/browser.js`](file:///Users/prince/Desktop/Projects/karya/agent/browser.js))**: Playwright Chromium wrapper running visible browser sessions (`headless: false`, `slowMo: 250`). Dynamically injects numeric `data-agent-id="N"` tags onto interactive elements (`a`, `button`, `input`, `select`, `textarea`) and extracts label context from `<label for>`, `aria-label`, placeholder, and text.
+- **Extensible Tool Registry ([`agent/tools.js`](file:///Users/prince/Desktop/Projects/karya/agent/tools.js))**: Fully decoupled tool definitions (`open_url`, `click`, `type_text`, `select_option`, `remember`, `ask_user`, `finish`). The loop executes tools purely by lookup without hardcoded tool conditionals.
+- **Single-Turn Prompt Engine ([`agent/prompts.js`](file:///Users/prince/Desktop/Projects/karya/agent/prompts.js))**: Generates fresh `[system message + one user message]` requests on every step to prevent LLM thought signature parsing issues.
+- **Autonomous Sense-Plan-Act Loop ([`agent/loop.js`](file:///Users/prince/Desktop/Projects/karya/agent/loop.js) & [`agent/index.js`](file:///Users/prince/Desktop/Projects/karya/agent/index.js))**: Two-stage execution cycle:
+  1. *Understand & Plan*: Generates goal, success criteria, and step-by-step plan.
+  2. *Act & Observe*: Max 25 iterations selecting actions based on latest observation, rolling history, and working memory, saving full-page screenshots and structured `trace.json` per step.
+
+---
+
+### 2. How the Loop Works (Step-by-Step)
+
+```mermaid
+flowchart TD
+    A["User Task + Company Context"] --> B["Stage 1: Understand & Plan"]
+    B --> C{"Missing Info?"}
+    C -- Yes --> D["ask_user in Terminal"]
+    D --> B
+    C -- No --> E["Launch Playwright Chromium (Visible)"]
+    E --> F["Observe Page (Set-of-Marks Tags)"]
+    F --> G["Build Fresh [System + Single User] Prompt"]
+    G --> H["LLM: Decide Single Action {thought, action, args}"]
+    H --> I["Execute Tool from Registry"]
+    I --> J["Capture Screenshot (step-NN.png) + Log Trace"]
+    J --> K{"Action == finish?"}
+    K -- No --> F
+    K -- Yes --> L["Print Summary & Save trace.json"]
+```
+
+1. **Understand & Plan**: One LLM call generates high-level success criteria and an operational checklist before touching the browser.
+2. **Observe**: The page is scraped into an indexed text representation with visible text and interactive element tags (e.g. `[6] link "New Invoice"`).
+3. **Decide**: The LLM analyzes the latest observation, working memory facts, and recent step history, outputting a single action in JSON.
+4. **Act**: The tool registry executes the action (`click`, `type_text`, `remember`, etc.) against the Playwright page.
+5. **Record Evidence**: A timestamped trace event and full-page PNG screenshot are saved to `runs/<runId>/`.
+6. **Iterate**: The tool output becomes the new observation for the next step until `finish` is called.
+
+---
+
+### 3. Example Trace Walkthrough (`run-20261026-190022`)
+
+Here is an abbreviated excerpt from our live acceptance test trace:
+
+```json
+{
+  "runId": "run-20261026-190022",
+  "task": "Find the latest invoice from Initech, extract the amount and due date, enter it into our ERP, and tell me once it is done.",
+  "status": "done",
+  "memory": {
+    "invoiceNumber": "INV-IT-1021",
+    "vendor": "Initech Solutions",
+    "amount": 42500,
+    "dueDate": "2026-11-20"
+  },
+  "steps": [
+    {
+      "step": 1,
+      "thought": "I need to open the mail inbox to find the latest invoice from Initech.",
+      "action": "open_url",
+      "args": { "url": "http://localhost:4000/mail" },
+      "ok": true
+    },
+    {
+      "step": 2,
+      "thought": "I see an email from billing@initech.example.com with subject 'Invoice INV-IT-1021 from Initech Solutions' dated 21 Oct 2026. This is the latest invoice.",
+      "action": "click",
+      "args": { "id": 11 },
+      "ok": true
+    },
+    {
+      "step": 3,
+      "thought": "I need to remember the invoice number INV-IT-1021 in working memory.",
+      "action": "remember",
+      "args": { "key": "invoiceNumber", "value": "INV-IT-1021" },
+      "ok": true
+    },
+    {
+      "step": 5,
+      "thought": "Remembering amount (42500) and due date (2026-11-20).",
+      "action": "remember",
+      "args": { "key": "amount", "value": 42500 },
+      "ok": true
+    },
+    {
+      "step": 7,
+      "thought": "Navigating to ERP to verify it is not already registered.",
+      "action": "open_url",
+      "args": { "url": "http://localhost:4000/erp" },
+      "ok": true
+    },
+    {
+      "step": 8,
+      "thought": "Logging into ERP with clerk credentials.",
+      "action": "type_text",
+      "args": { "id": 6, "text": "ap.clerk" },
+      "ok": true
+    },
+    {
+      "step": 11,
+      "thought": "Verified INV-IT-1021 is not in ERP list. Amount ₹42,500 < ₹50,000 threshold. Opening New Invoice form.",
+      "action": "click",
+      "args": { "id": 6 },
+      "ok": true
+    },
+    {
+      "step": 12,
+      "action": "select_option",
+      "args": { "id": 7, "option": "Initech Solutions" },
+      "ok": true
+    },
+    {
+      "step": 13,
+      "action": "type_text",
+      "args": { "id": 8, "text": "INV-IT-1021" },
+      "ok": true
+    },
+    {
+      "step": 14,
+      "action": "type_text",
+      "args": { "id": 9, "text": 42500 },
+      "ok": true
+    },
+    {
+      "step": 15,
+      "action": "type_text",
+      "args": { "id": 10, "text": "2026-11-20" },
+      "ok": true
+    },
+    {
+      "step": 16,
+      "thought": "Clicking Save Invoice button.",
+      "action": "click",
+      "args": { "id": 12 },
+      "ok": true
+    },
+    {
+      "step": 17,
+      "thought": "Invoice saved with success banner. Concluding task.",
+      "action": "finish",
+      "args": {
+        "status": "done",
+        "summary": "Successfully located latest invoice from Initech (INV-IT-1021, Amount: ₹42,500, Due Date: 2026-11-20), verified it was not a duplicate, checked threshold, and entered it into ERP."
+      },
+      "ok": true
+    }
+  ]
+}
+```
+
+---
+
+### 4. Technical Interview Questions & Answers
+
+#### Q1: Why do we use "Set-of-Marks" visual text indexing instead of sending raw HTML or accessibility trees?
+**Answer:**
+Raw HTML contains thousands of tokens of styling, scripts, and boilerplate that waste context window space, slow down inference, and distract the model. Accessibility trees are cleaner but often miss visual labels or input associations. "Set-of-Marks" dynamically numbers every interactive element (`[3] link "New Invoice"`) and surfaces human-visible labels. The LLM only needs to output an integer ID (`click(3)`), which eliminates fragile XPath or CSS selector hallucination.
+
+#### Q2: Why must every LLM request be built fresh as `[system + single user]` instead of appending multi-turn conversation messages?
+**Answer:**
+Modern reasoning models (such as Gemini 2.5/3.x) emit internal thought signatures and specialized formatting that can trigger schema validation or API errors when replayed as standard assistant history in OpenAI-compatible SDKs. By compiling all context (goal, criteria, working memory, rolling history, and latest observation) into a single fresh prompt each step, we maintain clean stateless calls with zero API format conflicts.
+
+#### Q3: How does the agent prevent context window explosion over a 20+ step workflow?
+**Answer:**
+In `agent/prompts.js`, we implement rolling history compression: the most recent 6 steps are included in full detail (thought, action, arguments, and outcome), while older steps are compressed into single-line summaries (`Step N: action(args) -> status`). This keeps input token growth nearly constant regardless of how many steps the agent executes.
+
