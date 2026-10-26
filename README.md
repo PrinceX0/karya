@@ -4,7 +4,7 @@ Karya (कार्य, "work") takes a plain-English request and gets it done t
 
 It runs against **Acme Corp**, a small simulated company I built for this project: a shared Accounts Payable mailbox and a Finance ERP.
 
-**Demo video:** <LINK>
+**Demo video:** [Watch the demo](https://youtu.be/Ud42KpyoWeI)
 
 > Example task: *"Find the latest invoice from Initech, extract the amount and due date, enter it into our ERP, and tell me once it is done."*
 > The task names no URLs, no field names and no steps. The agent works those out by itself.
@@ -119,7 +119,7 @@ The code runs that action, captures what changed, and repeats. The model never s
 
 1. **A simulated company instead of real websites.** The brief forbids real credentials. Owning the environment also means I control the ground truth for verification and can inject failures on demand, which is how I show reliability rather than just claim it.
 2. **Node.js and plain JavaScript everywhere.** It's my strongest stack, the agent and the sandbox share one language, and Playwright's Node API is first-class.
-3. **No agent framework; a small hand-written loop.** Every transition is visible in one file. In an interview I can point to exactly where a decision was made and change it live. Frameworks would hide the control flow I most need to debug.
+3. **No agent framework; a small custom loop.** Every transition is visible in one file. In an interview I can point to exactly where a decision was made and change it live. Frameworks would hide the control flow I most need to debug.
 4. **Understand-and-plan first, then a ReAct-style act/observe loop.** The plan gives direction and defines what "done" means. Step-by-step decisions handle surprises such as renamed buttons, errors or expired sessions.
 5. **Text "set-of-marks" observations instead of screenshots.** Numbered elements with labels are cheap, fast, work with free text models, and need no hard-coded selectors. That is why renamed labels don't break the agent. Screenshots are still taken, but as evidence for humans.
 6. **JSON actions (`thought`, `action`, `args`) instead of native function calling.** This works with any OpenAI-compatible provider and records the reasoning behind every single step. That makes "why did the agent do X?" answerable from the trace.
