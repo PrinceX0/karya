@@ -1,0 +1,4 @@
+# .gitignore - Prevents local dependencies, secrets, and generated run artifacts from being tracked in git
+node_modules/
+.env
+runs/
