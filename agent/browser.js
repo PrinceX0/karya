@@ -9,6 +9,29 @@ import { chromium } from "playwright";
 let browserInstance = null;
 let contextInstance = null;
 let pageInstance = null;
+let lastPageStatus = 200;
+
+// Helper to retry transient browser action failures (timeouts, detached elements) once after 1s
+async function withRetry(actionFn, actionName = "action") {
+  try {
+    return await actionFn();
+  } catch (err) {
+    const msg = String(err.message || "");
+    const isRetryable =
+      msg.includes("Timeout") ||
+      msg.includes("timeout") ||
+      msg.includes("detached") ||
+      msg.includes("Target closed") ||
+      msg.includes("Execution context was destroyed");
+
+    if (isRetryable) {
+      console.warn(`[Browser] ${actionName} hit transient issue (${msg.slice(0, 80)}). Retrying once in 1s...`);
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      return await actionFn();
+    }
+    throw err;
+  }
+}
 
 // Initialize Playwright Chromium browser
 export async function launchBrowser({ headless = false, slowMo = 250 } = {}) {
@@ -30,6 +53,21 @@ export async function launchBrowser({ headless = false, slowMo = 250 } = {}) {
   });
 
   pageInstance = await contextInstance.newPage();
+  lastPageStatus = 200;
+
+  // Track the HTTP status of the last main-frame document load
+  pageInstance.on("response", (response) => {
+    try {
+      if (
+        pageInstance &&
+        response.frame() === pageInstance.mainFrame() &&
+        response.request().resourceType() === "document"
+      ) {
+        lastPageStatus = response.status();
+      }
+    } catch {}
+  });
+
   return pageInstance;
 }
 
@@ -52,6 +90,40 @@ export async function closeBrowser() {
       await browserInstance.close();
     } catch {}
     browserInstance = null;
+  }
+}
+
+// Retrieve human-readable label of an element by its [id] tag
+export async function getElementLabel(id) {
+  if (!pageInstance) return "";
+  try {
+    const selector = `[data-agent-id="${String(id).trim()}"]`;
+    const element = pageInstance.locator(selector).first();
+    if ((await element.count()) === 0) return "";
+
+    return await element.evaluate((el) => {
+      let label = "";
+      if (el.id) {
+        const l = document.querySelector(`label[for="${el.id}"]`);
+        if (l) label = l.innerText.trim();
+      }
+      if (!label) {
+        const parentLabel = el.closest("label");
+        if (parentLabel) label = parentLabel.innerText.trim();
+      }
+      if (!label) {
+        label = el.getAttribute("aria-label") || el.getAttribute("placeholder") || "";
+      }
+      if (!label && (el.tagName.toLowerCase() === "a" || el.tagName.toLowerCase() === "button")) {
+        label = el.innerText.trim();
+      }
+      if (!label && el.name) {
+        label = el.name;
+      }
+      return label.replace(/\s+/g, " ").trim();
+    });
+  } catch {
+    return "";
   }
 }
 
@@ -165,87 +237,103 @@ export async function observe() {
   const url = pageInstance.url();
   const title = await pageInstance.title();
 
-  const formattedOutput = [
-    `URL: ${url}`,
+  const lines = [
+    `URL: ${url}`
+  ];
+
+  // Include non-2xx/3xx HTTP response status
+  if (lastPageStatus < 200 || lastPageStatus >= 400) {
+    lines.push(`LAST PAGE STATUS: ${lastPageStatus}`);
+  }
+
+  lines.push(
     `TITLE: ${title}`,
     `PAGE TEXT:`,
     elementsData.cleanBodyText,
     `INTERACTIVE ELEMENTS:`,
     elementsData.items.length > 0 ? elementsData.items.join("\n") : "(No interactive elements found)"
-  ].join("\n");
+  );
 
-  return formattedOutput;
+  return lines.join("\n");
 }
 
-// Navigate to a URL
+// Navigate to a URL with automatic 1s retry on transient failures
 export async function goto(url) {
-  if (!pageInstance) throw new Error("Browser not launched");
-  await pageInstance.goto(url, { waitUntil: "domcontentloaded" });
-  await pageInstance.waitForTimeout(300);
-  return await observe();
+  return await withRetry(async () => {
+    if (!pageInstance) throw new Error("Browser not launched");
+    await pageInstance.goto(url, { waitUntil: "domcontentloaded" });
+    await pageInstance.waitForTimeout(300);
+    return await observe();
+  }, `goto(${url})`);
 }
 
-// Click on an interactive element by its [id] tag
+// Click on an interactive element by its [id] tag with automatic retry
 export async function click(id) {
-  if (!pageInstance) throw new Error("Browser not launched");
-  const selector = `[data-agent-id="${String(id).trim()}"]`;
-  const element = pageInstance.locator(selector).first();
+  return await withRetry(async () => {
+    if (!pageInstance) throw new Error("Browser not launched");
+    const selector = `[data-agent-id="${String(id).trim()}"]`;
+    const element = pageInstance.locator(selector).first();
 
-  const count = await element.count();
-  if (count === 0) {
-    throw new Error(`Element with id [${id}] was not found on the page.`);
-  }
+    const count = await element.count();
+    if (count === 0) {
+      throw new Error(`Element with id [${id}] was not found on the page.`);
+    }
 
-  await Promise.all([
-    pageInstance.waitForLoadState("domcontentloaded").catch(() => {}),
-    element.click()
-  ]);
+    await Promise.all([
+      pageInstance.waitForLoadState("domcontentloaded").catch(() => {}),
+      element.click()
+    ]);
 
-  await pageInstance.waitForTimeout(300);
-  return await observe();
+    await pageInstance.waitForTimeout(300);
+    return await observe();
+  }, `click(${id})`);
 }
 
-// Type into an input or textarea element (clears existing content first)
+// Type into an input or textarea element with automatic retry
 export async function type(id, text) {
-  if (!pageInstance) throw new Error("Browser not launched");
-  const selector = `[data-agent-id="${String(id).trim()}"]`;
-  const element = pageInstance.locator(selector).first();
+  return await withRetry(async () => {
+    if (!pageInstance) throw new Error("Browser not launched");
+    const selector = `[data-agent-id="${String(id).trim()}"]`;
+    const element = pageInstance.locator(selector).first();
 
-  const count = await element.count();
-  if (count === 0) {
-    throw new Error(`Element with id [${id}] was not found on the page.`);
-  }
+    const count = await element.count();
+    if (count === 0) {
+      throw new Error(`Element with id [${id}] was not found on the page.`);
+    }
 
-  await element.fill("");
-  await element.fill(String(text));
-  await pageInstance.waitForTimeout(300);
-  return await observe();
+    await element.fill("");
+    await element.fill(String(text));
+    await pageInstance.waitForTimeout(300);
+    return await observe();
+  }, `type(${id})`);
 }
 
-// Select an option in a <select> element by label or value
+// Select an option in a <select> element by label or value with automatic retry
 export async function select(id, optionLabel) {
-  if (!pageInstance) throw new Error("Browser not launched");
-  const selector = `[data-agent-id="${String(id).trim()}"]`;
-  const element = pageInstance.locator(selector).first();
+  return await withRetry(async () => {
+    if (!pageInstance) throw new Error("Browser not launched");
+    const selector = `[data-agent-id="${String(id).trim()}"]`;
+    const element = pageInstance.locator(selector).first();
 
-  const count = await element.count();
-  if (count === 0) {
-    throw new Error(`Element with id [${id}] was not found on the page.`);
-  }
+    const count = await element.count();
+    if (count === 0) {
+      throw new Error(`Element with id [${id}] was not found on the page.`);
+    }
 
-  const cleanOption = typeof optionLabel === "object"
-    ? String(optionLabel.label || optionLabel.value || "")
-    : String(optionLabel);
+    const cleanOption = typeof optionLabel === "object"
+      ? String(optionLabel.label || optionLabel.value || "")
+      : String(optionLabel);
 
-  try {
-    await element.selectOption({ label: cleanOption });
-  } catch {
-    // Fallback to value match
-    await element.selectOption({ value: cleanOption });
-  }
+    try {
+      await element.selectOption({ label: cleanOption });
+    } catch {
+      // Fallback to value match
+      await element.selectOption({ value: cleanOption });
+    }
 
-  await pageInstance.waitForTimeout(300);
-  return await observe();
+    await pageInstance.waitForTimeout(300);
+    return await observe();
+  }, `select(${id})`);
 }
 
 // Take a full-page screenshot and save to designated file path

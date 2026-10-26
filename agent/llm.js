@@ -26,27 +26,34 @@ const fallbackConfig = {
 function extractJSON(rawText) {
   if (!rawText || typeof rawText !== "string") return null;
 
-  // Strip markdown code fences if present
-  let cleaned = rawText.replace(/```(?:json)?\s*([\s\S]*?)\s*```/gi, "$1").trim();
-
-  // Find boundaries of the first valid JSON object
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-
-  if (start !== -1 && end !== -1 && end > start) {
-    const candidate = cleaned.slice(start, end + 1);
+  function tryParse(str) {
+    if (!str) return null;
     try {
-      return JSON.parse(candidate);
-    } catch {
-      // Continue to full string attempt
-    }
-  }
-
-  try {
-    return JSON.parse(cleaned);
-  } catch {
+      return JSON.parse(str);
+    } catch {}
+    try {
+      // Fix trailing commas
+      const fixed = str.replace(/,\s*([}\]])/g, "$1");
+      return JSON.parse(fixed);
+    } catch {}
     return null;
   }
+
+  // 1. Try after stripping markdown code blocks
+  let cleaned = rawText.replace(/```(?:json)?\s*([\s\S]*?)\s*```/gi, "$1").trim();
+  let direct = tryParse(cleaned);
+  if (direct) return direct;
+
+  // 2. Find boundaries of outer { ... }
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) {
+    const candidate = cleaned.slice(start, end + 1);
+    const parsed = tryParse(candidate);
+    if (parsed) return parsed;
+  }
+
+  return tryParse(rawText);
 }
 
 // Sleep helper for exponential backoff

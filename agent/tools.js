@@ -60,14 +60,19 @@ export const tools = [
   },
   {
     name: "remember",
-    description: "Store an extracted piece of data (amount, invoiceNumber, dueDate, vendor, etc.) into working memory.",
+    description: "Store extracted data (amount, invoiceNumber, dueDate, vendor, etc.) into working memory. You can store multiple facts at once with { facts: { amount, dueDate, invoiceNumber, vendor } } or a single { key, value }.",
     args: {
-      key: "string - The attribute name (e.g., 'amount', 'dueDate')",
-      value: "any - The exact extracted value"
+      facts: "optional object - Multiple key-value pairs to store simultaneously (e.g. { amount: 42500, dueDate: '2026-11-20', invoiceNumber: 'INV-IT-1021' })",
+      key: "optional string - The attribute name if storing a single fact",
+      value: "optional any - The extracted value if storing a single fact"
     },
     risk: "read",
     run: async (args, ctx) => {
-      if (!args.key) throw new Error("remember requires a 'key' argument.");
+      if (args.facts && typeof args.facts === "object") {
+        Object.assign(ctx.memory, args.facts);
+        return `Stored in working memory: ${JSON.stringify(args.facts)}`;
+      }
+      if (!args.key) throw new Error("remember requires 'facts' object or 'key' argument.");
       if (args.value === undefined) throw new Error("remember requires a 'value' argument.");
 
       ctx.memory[args.key] = args.value;
@@ -87,6 +92,7 @@ export const tools = [
         throw new Error("Human interaction callback is not configured in ctx.");
       }
       const answer = await ctx.askHuman(args.question);
+      ctx.memory[`user_answer_${Date.now()}`] = { question: args.question, answer };
       return `User responded: "${answer}"`;
     }
   },

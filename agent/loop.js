@@ -1,13 +1,16 @@
 // agent/loop.js
 // Autonomous task execution loop implementing the Sense -> Plan -> Act -> Observe cycle.
-// Coordinates LLM decision-making, browser interactions, memory retention, and evidence logging.
+// Integrates failure detection, human-in-the-loop guardrails, independent verification, and report generation.
 
 import fs from "fs";
 import path from "path";
 import readline from "readline";
-import { chatJSON } from "./llm.js";
+import { chatJSON, getLLMCallCount } from "./llm.js";
 import * as browser from "./browser.js";
 import { getTool } from "./tools.js";
+import { Guard } from "./guard.js";
+import { verifyRun } from "./verifier.js";
+import { generateRunReport } from "./report.js";
 import {
   buildSystemPrompt,
   buildPlanningMessages,
@@ -17,11 +20,12 @@ import {
 // Terminal interaction helper for asking the user clarifications or approvals
 export function askUserInTerminal(question) {
   return new Promise((resolve) => {
-    // If not a TTY or running in non-interactive mode, provide safe default
+    // If not a TTY or running in non-interactive mode, check environment auto-replies
     if (!process.stdin.isTTY && !process.env.INTERACTIVE) {
       console.log(`\n❓ [Prompt to User]: ${question}`);
-      console.log(`[Auto-Reply in non-interactive environment]: Approved / Yes`);
-      return resolve("Yes");
+      const autoAnswer = process.env.AUTO_REPLY || "yes";
+      console.log(`[Auto-Reply in non-interactive environment]: ${autoAnswer}`);
+      return resolve(autoAnswer);
     }
 
     const rl = readline.createInterface({
@@ -48,8 +52,10 @@ export async function runAgentLoop({
   task,
   companyContextPath = path.resolve(process.cwd(), "company/context.md"),
   maxSteps = 25,
+  maxDurationMs = Number(process.env.MAX_DURATION_MS) || (6 * 60 * 1000), // 6 minutes default budget
   askHuman = askUserInTerminal
 }) {
+  const startTime = Date.now();
   const runId = generateRunId();
   const runDir = path.resolve(process.cwd(), "runs", runId);
   fs.mkdirSync(runDir, { recursive: true });
@@ -65,6 +71,15 @@ export async function runAgentLoop({
   }
   const companyContext = fs.readFileSync(companyContextPath, "utf-8");
 
+  // Initialize guardrails
+  const guard = new Guard({
+    askHuman: async (question) => {
+      const answer = await askHuman(question);
+      guard.recordInteraction(question, answer);
+      return answer;
+    }
+  });
+
   // Step 1: UNDERSTAND + PLAN
   console.log("📋 Phase 1: Understanding task and formulating plan...");
   let planningMessages = buildPlanningMessages(task, companyContext);
@@ -73,7 +88,8 @@ export async function runAgentLoop({
   // If information is missing, ask the user and replan
   while (planOutput.missing_info) {
     console.log(`\n⚠️ Missing Information Detected: ${planOutput.missing_info}`);
-    const humanAnswer = await askHuman(planOutput.missing_info);
+    const humanAnswer = await guard.askHuman(planOutput.missing_info);
+    guard.recordInteraction(planOutput.missing_info, humanAnswer);
     const enrichedTask = `${task}\n(User clarification: "${humanAnswer}")`;
     planningMessages = buildPlanningMessages(enrichedTask, companyContext);
     planOutput = await chatJSON(planningMessages);
@@ -105,13 +121,19 @@ export async function runAgentLoop({
     summary: "",
     result: null,
     memory,
-    steps: []
+    steps: [],
+    approvals: [],
+    interactions: []
   };
 
   const ctx = {
     memory,
     browser,
-    askHuman,
+    askHuman: async (question) => {
+      const answer = await guard.askHuman(question);
+      guard.recordInteraction(question, answer);
+      return answer;
+    },
     finished: false,
     finishResult: null
   };
@@ -121,11 +143,30 @@ To start your investigation, use the 'open_url' tool to navigate to one of the c
 - Accounts Payable Mail: http://localhost:4000/mail
 - Finance ERP: http://localhost:4000/erp`;
 
+  // Loop detection tracker
+  let lastActionSignature = "";
+  let repeatActionCount = 0;
+  let loopWarning = false;
+
+  let finalStatus = "FAILED ❌";
+  let verificationData = null;
+  let reVerificationAttempts = 0;
+
   // Step 2: ACT -> OBSERVE Loop
   let step = 1;
 
   try {
     for (step = 1; step <= maxSteps; step++) {
+      // Check execution time budget (6 minutes)
+      const elapsedMs = Date.now() - startTime;
+      if (elapsedMs >= maxDurationMs) {
+        console.warn(`\n⏱️ Execution budget exceeded: ${Math.round(elapsedMs / 1000)}s >= 360s limit.`);
+        trace.status = "failed";
+        trace.summary = `Exceeded maximum duration budget (6 minutes). Completed ${step - 1} steps before time expired.`;
+        finalStatus = "FAILED ❌";
+        break;
+      }
+
       console.log(`\n--- Step ${step}/${maxSteps} ---`);
 
       // Build fresh single-turn prompt: [system message + one user message]
@@ -136,7 +177,8 @@ To start your investigation, use the 'open_url' tool to navigate to one of the c
         plan,
         memory,
         history,
-        observation: currentObservation
+        observation: currentObservation,
+        loopWarning
       });
 
       const messages = [
@@ -153,20 +195,45 @@ To start your investigation, use the 'open_url' tool to navigate to one of the c
       console.log(`🤔 Thought: ${thought}`);
       console.log(`▶ Action: ${actionName}(${JSON.stringify(args)})`);
 
+      // Loop detection tracking
+      const actionSignature = `${actionName}:${JSON.stringify(args)}`;
+      if (actionSignature === lastActionSignature) {
+        repeatActionCount++;
+      } else {
+        lastActionSignature = actionSignature;
+        repeatActionCount = 1;
+      }
+      loopWarning = repeatActionCount >= 3;
+
       let toolResult = "";
       let isOk = true;
 
       const tool = getTool(actionName);
       if (!tool) {
         isOk = false;
-        toolResult = `Error: Tool '${actionName}' does not exist. Available tools: open_url, click, type_text, select_option, remember, ask_user, finish.`;
+        toolResult = `ERROR: Tool '${actionName}' does not exist. Available tools: open_url, click, type_text, select_option, remember, ask_user, finish.`;
       } else {
-        try {
-          toolResult = await tool.run(args, ctx);
-          isOk = true;
-        } catch (err) {
+        // Enforce Guardrails (URL allowlist & human-in-the-loop approval)
+        const guardCheck = await guard.checkAction({
+          actionName,
+          args,
+          thought,
+          tool,
+          browser
+        });
+
+        if (!guardCheck.allowed) {
           isOk = false;
-          toolResult = `Tool execution error: ${err.message}`;
+          toolResult = guardCheck.observation;
+        } else {
+          try {
+            toolResult = await tool.run(args, ctx);
+            isOk = true;
+          } catch (err) {
+            isOk = false;
+            // Failure recovery: tool errors never crash run, prefixed with ERROR:
+            toolResult = `ERROR: ${err.message}`;
+          }
         }
       }
 
@@ -175,10 +242,16 @@ To start your investigation, use the 'open_url' tool to navigate to one of the c
       console.log(`${isOk ? "✓" : "✗"} ${firstLine.slice(0, 100)}`);
 
       // Update observation for the next step
-      if (typeof toolResult === "string" && (actionName === "open_url" || actionName === "click" || actionName === "type_text" || actionName === "select_option")) {
+      if (
+        typeof toolResult === "string" &&
+        (actionName === "open_url" ||
+          actionName === "click" ||
+          actionName === "type_text" ||
+          actionName === "select_option")
+      ) {
         currentObservation = toolResult;
-      } else if (actionName === "remember" || actionName === "ask_user") {
-        // If a non-navigational tool executed, append latest browser observation so agent retains visual context
+      } else if (actionName === "remember" || actionName === "ask_user" || !isOk) {
+        // If a non-navigational tool executed or error occurred, append latest page view
         try {
           const pageObs = await browser.observe();
           currentObservation = `${toolResult}\n\nCURRENT PAGE VIEW:\n${pageObs}`;
@@ -194,9 +267,7 @@ To start your investigation, use the 'open_url' tool to navigate to one of the c
       const screenshotPath = path.join(runDir, `step-${stepPadded}.png`);
       try {
         await browser.screenshot(screenshotPath);
-      } catch (screenshotErr) {
-        // Non-fatal if page was closed or navigating
-      }
+      } catch (screenshotErr) {}
 
       // Append trace event
       const stepEvent = {
@@ -211,37 +282,111 @@ To start your investigation, use the 'open_url' tool to navigate to one of the c
 
       history.push(stepEvent);
       trace.steps.push(stepEvent);
+      trace.approvals = guard.getApprovalLog();
+      trace.interactions = guard.getInteractionLog();
 
       // Persist trace after every step
       fs.writeFileSync(path.join(runDir, "trace.json"), JSON.stringify(trace, null, 2));
 
-      // Stop if finish tool was invoked
+      // Handle finish invocation
       if (ctx.finished) {
-        trace.status = ctx.finishResult.status;
-        trace.summary = ctx.finishResult.summary;
-        trace.result = ctx.finishResult.result;
-        fs.writeFileSync(path.join(runDir, "trace.json"), JSON.stringify(trace, null, 2));
-        break;
+        const claimedStatus = ctx.finishResult.status;
+
+        if (claimedStatus === "done") {
+          // Independent Verification against privileged ground truth
+          verificationData = await verifyRun({
+            task,
+            successCriteria: success_criteria,
+            claimedSummary: ctx.finishResult.summary,
+            claimedResult: ctx.finishResult.result,
+            browser,
+            runDir
+          });
+
+          if (verificationData.verified) {
+            finalStatus = "VERIFIED ✅";
+            trace.status = "done";
+            trace.summary = ctx.finishResult.summary;
+            trace.result = ctx.finishResult.result;
+            break;
+          } else if (reVerificationAttempts < 1) {
+            // Re-attempt loop once if verification failed
+            reVerificationAttempts++;
+            ctx.finished = false;
+            console.log(`\n⚠️ Verification discrepancies found. Re-injecting into agent loop for correction...`);
+            currentObservation = `ERROR: Independent verification failed: ${verificationData.problems.join("; ")}. Please correct the record or finish the missing work.`;
+            continue;
+          } else {
+            finalStatus = "NOT VERIFIED ❌";
+            trace.status = "failed";
+            trace.summary = ctx.finishResult.summary;
+            trace.result = ctx.finishResult.result;
+            break;
+          }
+        } else if (claimedStatus === "blocked") {
+          finalStatus = "BLOCKED ⏸";
+          trace.status = "blocked";
+          trace.summary = ctx.finishResult.summary;
+          trace.result = ctx.finishResult.result;
+          break;
+        } else {
+          finalStatus = "FAILED ❌";
+          trace.status = "failed";
+          trace.summary = ctx.finishResult.summary;
+          trace.result = ctx.finishResult.result;
+          break;
+        }
       }
     }
 
     if (!ctx.finished && step > maxSteps) {
+      finalStatus = "FAILED ❌";
       trace.status = "failed";
       trace.summary = `Exceeded maximum step budget of ${maxSteps} steps without finishing.`;
-      fs.writeFileSync(path.join(runDir, "trace.json"), JSON.stringify(trace, null, 2));
     }
   } finally {
-    // Keep browser open for 2 seconds so humans can see final state, then close
-    await new Promise((r) => setTimeout(r, 2000));
+    // Keep browser open for 1.5s before closing
+    await new Promise((r) => setTimeout(r, 1500));
     await browser.closeBrowser();
   }
 
+  const durationSeconds = (Date.now() - startTime) / 1000;
+  trace.finalStatus = finalStatus;
+  trace.durationSeconds = durationSeconds;
+  trace.verification = verificationData;
+
+  // Persist final trace
+  fs.writeFileSync(path.join(runDir, "trace.json"), JSON.stringify(trace, null, 2));
+
+  // Generate self-contained HTML evidence report
+  const reportPath = generateRunReport({
+    runId,
+    task,
+    finalStatus,
+    summary: trace.summary,
+    verification: verificationData,
+    memory,
+    steps: trace.steps,
+    approvals: guard.getApprovalLog(),
+    interactions: guard.getInteractionLog(),
+    durationSeconds,
+    llmCalls: getLLMCallCount(),
+    runDir
+  });
+
   console.log(`\n======================================================`);
   console.log(`🏁 Agent Execution Finished`);
-  console.log(`Status:  ${trace.status.toUpperCase()}`);
-  console.log(`Summary: ${trace.summary}`);
-  console.log(`Evidence saved to: runs/${runId}/`);
+  console.log(`Final Status: ${finalStatus}`);
+  console.log(`Summary:      ${trace.summary}`);
+  console.log(`Report:       ${reportPath}`);
   console.log(`======================================================\n`);
 
-  return trace;
+  return {
+    runId,
+    finalStatus,
+    summary: trace.summary,
+    result: trace.result,
+    verification: verificationData,
+    reportPath
+  };
 }

@@ -230,3 +230,36 @@ Modern reasoning models (such as Gemini 2.5/3.x) emit internal thought signature
 **Answer:**
 In `agent/prompts.js`, we implement rolling history compression: the most recent 6 steps are included in full detail (thought, action, arguments, and outcome), while older steps are compressed into single-line summaries (`Step N: action(args) -> status`). This keeps input token growth nearly constant regardless of how many steps the agent executes.
 
+---
+
+## Phase 3: Reliability, Guardrails, Independent Verification & Reporting
+
+### 1. Key Architectural Additions
+
+- **Failure Detection & Recovery (`agent/browser.js`, `agent/loop.js`)**:
+  - Tool errors never crash the run; they are caught and fed back to the LLM as observations prefixed with `ERROR:`, allowing the LLM to self-heal.
+  - Browser actions retry transient failures (timeouts, detached DOM elements) once after 1s.
+  - Page response HTTP status is tracked; non-2xx/3xx codes trigger `LAST PAGE STATUS: 503` in the observation so the agent adapts.
+  - Action loop detection flags if identical action signatures repeat 3 times in succession, warning the agent to change tactics.
+- **Human-in-the-Loop & Hard Guardrails (`agent/guard.js`)**:
+  - Hard guard in code (cannot be bypassed by LLM prompt injection). Pauses and asks confirmation for any tool with risk `irreversible` or clicks matching `/pay|paid|delete|remove|approve|reject/i`.
+  - URL Allowlist enforces strict navigation boundaries: only `http://localhost:4000/mail*` and `http://localhost:4000/erp*` are accessible.
+- **Independent Verification (`agent/verifier.js`)**:
+  - An out-of-band auditor that does not trust agent claims. Fetches ground-truth data from privileged `GET /api/state` and conducts an independent fresh LLM evaluation against original success criteria.
+- **Self-Contained Evidence Report (`agent/report.js`)**:
+  - Compiles run metadata, final status badges (`VERIFIED ✅`, `BLOCKED ⏸`, `FAILED ❌`), full timeline, approvals, and screenshot thumbnails into `runs/<runId>/report.html`.
+
+### 2. Phase 3 Technical Interview Questions & Answers
+
+#### Q1: Why must the Verifier be independent and query ground truth out-of-band rather than asking the agent to verify itself?
+**Answer:**
+Self-verification suffers from confirmation bias and LLM hallucination—if an agent hallucinates that it saved an invoice, asking it to verify its own work in the same context will almost always yield a false positive. An independent verifier uses a fresh LLM call with zero conversation bias and compares the assigned criteria directly against ground-truth database state (`/api/state`) that the agent cannot access or forge.
+
+#### Q2: What is the difference between Hard Guardrails and Soft Policies?
+**Answer:**
+Hard guardrails are deterministic code boundaries enforced outside the model's control (e.g., regex checks on URLs and click labels that intercept tool calls and block execution or require explicit human terminal approval). Soft policies are instructed via system prompts (e.g., asking for clarification when vendor names are ambiguous or respecting spending limits). Hard guardrails protect against prompt injection and model failures; soft policies guide decision-making during normal operation.
+
+#### Q3: How does the agent achieve idempotency when facing transient errors like HTTP 503s?
+**Answer:**
+Through dual-layer design: the system prompt instructs the agent to inspect existing records before creating new ones and check if a record actually saved before blindly resubmitting. Combined with tracking page response status (`LAST PAGE STATUS: 503`), the agent understands when an error is transient, navigates back or refreshes, verifies the ERP state, and avoids creating duplicate invoices.
+
